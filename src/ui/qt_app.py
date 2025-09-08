@@ -9,6 +9,7 @@ from ..paths import MODEL_PATH
 from ..logic.geometry import infer_pointing_direction
 from ..system.system_controller import SystemController
 from ..vision.draw import draw_hands, draw_hud
+from ..storage.db import UrlStore  # for default URL name and lookups
 
 # ===== MediaPipe aliases =====
 BaseOptions = mp.tasks.BaseOptions
@@ -34,7 +35,7 @@ GESTURE_LABELS = [
     "ILoveYou",
 ]
 
-# Available actions
+# Base actions (URL options are added in GUI as OPEN_URL:<Name>)
 ACTION_CHOICES = [
     "VOL_UP", "VOL_DOWN", "MUTE_TOGGLE",
     "OPEN_CALCULATOR", "OPEN_CLOCK", "OPEN_NOTES", "OPEN_CALENDAR",
@@ -42,10 +43,10 @@ ACTION_CHOICES = [
     "OPEN_PHOTOS", "OPEN_MUSIC", "OPEN_LAUNCHPAD",
     "START_SCREENSAVER", "DISPLAY_SLEEP", "WIFI_ON", "WIFI_OFF",
     "BT_ON", "BT_OFF", "DARKMODE_TOGGLE",
-    "OPEN_URL",
+    # do NOT include plain "OPEN_URL" here; GUI appends OPEN_URL:<Name>
 ]
 
-# Default bindings
+# Default bindings (point ILoveYou to the seeded default URL name)
 DEFAULT_BINDINGS = {
     "Thumb_Up":    "VOL_UP",
     "Thumb_Down":  "VOL_DOWN",
@@ -53,7 +54,7 @@ DEFAULT_BINDINGS = {
     "Pointing_Up": "DISPLAY_SLEEP",
     "Closed_Fist": "OPEN_MAPS",
     "Victory":     "OPEN_LAUNCHPAD",
-    "ILoveYou":    "OPEN_URL",
+    "ILoveYou":    f"OPEN_URL:{UrlStore.DEFAULT_NAME}",
     # "Pointing_Down": "VOL_DOWN",
 }
 
@@ -61,7 +62,7 @@ class GestureEngine(QtCore.QObject):
     """Encapsulates MediaPipe + bindings / debouncing / cooldown + system actions for GUI use."""
     hudChanged = QtCore.Signal(str, str)  # (label, hint)
 
-    def __init__(self, camera_index=0, bindings=None, open_url_default="https://www.youtube.com/"):
+    def __init__(self, camera_index=0, bindings=None, url_store: UrlStore | None = None):
         super().__init__()
         import os
         if not os.path.exists(MODEL_PATH):
@@ -69,10 +70,10 @@ class GestureEngine(QtCore.QObject):
 
         self.camera_index = camera_index
         self.bindings: Dict[str, str] = dict(bindings or DEFAULT_BINDINGS)
-        self.open_url_default = open_url_default
         self.active = False  # gesture control toggle (default off)
 
         self.sys = SystemController()
+        self.urls = url_store or UrlStore()   # named URLs (SQLite)
 
         self.last_result: GestureRecognizerResult | None = None
         self.last_label: str | None = None
@@ -93,7 +94,6 @@ class GestureEngine(QtCore.QObject):
         # Camera
         self.cap = cv2.VideoCapture(self.camera_index)
         if not self.cap.isOpened():
-            # On macOS, AVFoundation backend is often required
             try:
                 self.cap.release()
             except Exception:
@@ -107,7 +107,7 @@ class GestureEngine(QtCore.QObject):
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-        # Initialize FPS calculation variables
+        # FPS
         self.prev_t = time.perf_counter()
         self.fps = 0.0
 
@@ -117,9 +117,6 @@ class GestureEngine(QtCore.QObject):
 
     def set_bindings(self, bindings: Dict[str, str]):
         self.bindings = dict(bindings)
-
-    def set_open_url(self, url: str):
-        self.open_url_default = url
 
     # ---- MediaPipe callback ----
     def _on_result(self, result: GestureRecognizerResult, output_image: mp.Image, timestamp_ms: int):
@@ -135,12 +132,12 @@ class GestureEngine(QtCore.QObject):
                     break
         self.last_label = label
 
-    # ---- Flash HUD message ----
+    # ---- HUD ----
     def _flash(self, msg, duration=0.7):
         self.overlay_msg, self.overlay_until = msg, time.time() + duration
         self.hudChanged.emit(self.last_label or "", msg)
 
-    # ---- Execute action ----
+    # ---- Execute ----
     def _perform(self, cmd: str):
         s = self.sys
         if   cmd == "VOL_UP":               s.volume_up();            self._flash("🔊 Volume +")
@@ -164,13 +161,22 @@ class GestureEngine(QtCore.QObject):
         elif cmd == "BT_ON":                s.bt_on();                self._flash("🅱️ Bluetooth ON")
         elif cmd == "BT_OFF":               s.bt_off();               self._flash("🅱️ Bluetooth OFF")
         elif cmd == "DARKMODE_TOGGLE":      s.darkmode_toggle();      self._flash("🌗 Dark Mode")
-        elif cmd == "OPEN_URL":             s.open_url(self.open_url_default); self._flash("🌐 Open URL")
+
+        elif cmd.startswith("OPEN_URL:"):
+            # Per-gesture named URL (e.g., OPEN_URL:YouTube)
+            name = cmd.split(":", 1)[1].strip()
+            url  = self.urls.get_url(name)
+            if url:
+                s.open_url(url)
+                self._flash(f"🌐 Open URL: {name}")
+            else:
+                self._flash(f"⚠️ URL preset not found: {name}", 1.2)
+
         else:
             self._flash(f"(noop) {cmd}", 0.4)
 
-    # ---- Select command from result ----
+    # ---- Choose command ----
     def _choose_command(self, result: GestureRecognizerResult):
-        # Geometric fallback: Pointing_Down
         pd = infer_pointing_direction(result)
         if pd == "Pointing_Down":
             cmd = self.bindings.get("Pointing_Down")
@@ -192,14 +198,11 @@ class GestureEngine(QtCore.QObject):
                 best_cmd, best_score = cmd, top.score
         return best_cmd
 
-    # ---- Process each frame (called by GUI timer) ----
+    # ---- Step per frame ----
     def step(self):
         ok, frame_bgr = self.cap.read()
         if not ok:
             return None, 0.0
-
-        # Optional: mirror for selfie view
-        # frame_bgr = cv2.flip(frame_bgr, 1)
 
         now = time.perf_counter()
         dt = now - self.prev_t
@@ -207,13 +210,11 @@ class GestureEngine(QtCore.QObject):
         if dt > 0:
             self.fps = 0.9 * self.fps + 0.1 * (1.0 / dt)
 
-        # Inference
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         ts_ms = int(time.perf_counter() * 1000)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
         self.recognizer.recognize_async(mp_image, ts_ms)
 
-        # Trigger only if active
         if self.active:
             cmd = self._choose_command(self.last_result)
             if cmd is None:
@@ -229,7 +230,6 @@ class GestureEngine(QtCore.QObject):
                     self._perform(cmd)
                     self.last_fire_ts, self.armed = time.time(), False
 
-        # Overlay drawing
         if self.last_result:
             draw_hands(frame_bgr, self.last_result)
         hint = self.overlay_msg if time.time() <= self.overlay_until else None
@@ -240,6 +240,10 @@ class GestureEngine(QtCore.QObject):
     def close(self):
         try:
             self.recognizer.close()
+        except Exception:
+            pass
+        try:
+            self.urls.close()
         except Exception:
             pass
         try:
